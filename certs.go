@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"appengine"
 )
 
 // Certificates holds a collection of public certificates that are fetched from
@@ -18,15 +19,18 @@ import (
 // expired.
 type Certificates struct {
 	// URL to retrieve the public certificates, meant to be initialized only once.
-	URL string
+	URL       string
 	// Transport is the network transport, meant to be initialized only once.
 	Transport http.RoundTripper
 	// lock for the certs and the exp
 	sync.RWMutex
 	// certs is a map of all the public x509 certificates hosted at URL.
-	certs map[string]*x509.Certificate
+	certsBinary     []byte
+	certs     map[string]*x509.Certificate
 	// exp is the expiry time for the certificates.
-	exp time.Time
+	exp       time.Time
+
+	ctx       appengine.Context
 }
 
 // Cert returns the public certificate for the given key ID.
@@ -53,41 +57,43 @@ func (c *Certificates) ensureLoaded() error {
 	}
 	c.RUnlock()
 
-	certs, cacheTime, err := download(c.URL, c.Transport)
+	b, certs, cacheTime, err := download(c.ctx, c.URL, c.Transport)
 	if err != nil {
 		return err
 	}
 
 	c.Lock()
 	defer c.Unlock()
+	c.certsBinary = b;
 	c.certs = certs
 	c.exp = time.Now().Add(cacheTime)
 	return nil
 }
 
 // download fetches the public certificates hosted at a given URL.
-func download(url string, transport http.RoundTripper) (map[string]*x509.Certificate, time.Duration, error) {
+func download(ctx appengine.Context, url string, transport http.RoundTripper) ([]byte, map[string]*x509.Certificate, time.Duration, error) {
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
 	client := http.Client{Transport: transport}
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, 0, fmt.Errorf("download %s fails: %s", url, resp.Status)
+		return nil, nil, 0, fmt.Errorf("download %s fails: %s", url, resp.Status)
 	}
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
-	certs, err := parse(b)
+	certs, err := Parse(b)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
-	return certs, cacheTime(resp), nil
+
+	return b, certs, cacheTime(resp), nil
 }
 
 // parse parses the certificates response in JSON format.
@@ -96,7 +102,7 @@ func download(url string, transport http.RoundTripper) (map[string]*x509.Certifi
 //   "kid1": "-----BEGIN CERTIFICATE-----...-----END CERTIFICATE-----",
 //   "kid2": "-----BEGIN CERTIFICATE-----...-----END CERTIFICATE-----",
 // }
-func parse(b []byte) (map[string]*x509.Certificate, error) {
+func Parse(b []byte) (map[string]*x509.Certificate, error) {
 	m := make(map[string]string)
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, err
